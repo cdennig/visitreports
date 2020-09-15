@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/fvbock/endless"
 	"github.com/gin-gonic/gin"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/pkg/errors"
@@ -82,7 +83,7 @@ func main() {
 	})
 	r.GET("/reports", list)
 	r.GET("/reports/:reportid", read)
-	r.Run(":3000")
+	endless.ListenAndServe(":3000", r)
 }
 
 func list(c *gin.Context) {
