@@ -11,12 +11,14 @@ import (
 	"time"
 
 	servicebus "github.com/Azure/azure-service-bus-go"
-	"github.com/fvbock/endless"
-	"github.com/gin-contrib/cors"
-	"github.com/gin-gonic/gin"
+	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
+	"github.com/iris-contrib/middleware/cors"
 	"github.com/jinzhu/copier"
 	"github.com/joho/godotenv"
+	"github.com/kataras/iris/v12"
+	"github.com/kataras/iris/v12/middleware/logger"
+	"github.com/kataras/iris/v12/middleware/recover"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/pkg/errors"
 	"github.com/vippsas/go-cosmosdb/cosmosapi"
@@ -31,9 +33,18 @@ type config struct {
 	Env                  string
 }
 
+type validationError struct {
+	ActualTag string `json:"tag"`
+	Namespace string `json:"namespace"`
+	Kind      string `json:"kind"`
+	Type      string `json:"type"`
+	Value     string `json:"value"`
+	Param     string `json:"param"`
+}
+
 // ContactDoc - Base contact properties
 type ContactDoc struct {
-	Id             string `json:"id" binding:"required"`
+	Id             string `json:"id" validate:"required"`
 	Firstname      string `json:"firstname"`
 	Lastname       string `json:"lastname"`
 	AvatarLocation string `json:"avatarLocation"`
@@ -75,20 +86,20 @@ type VisitReportEventDoc struct {
 
 // VisitReportCreateDoc - struct for creating a VR
 type VisitReportCreateDoc struct {
-	Subject     string     `json:"subject" binding:"required" validate:"max=255"`
+	Subject     string     `json:"subject" validate:"required,max=255"`
 	Description string     `json:"description" validate:"max=500"`
-	VisitDate   string     `json:"visitDate" binding:"required"`
-	Contact     ContactDoc `json:"contact"  binding:"required"`
+	VisitDate   string     `json:"visitDate" validate:"required"`
+	Contact     ContactDoc `json:"contact"  validate:"required"`
 }
 
 // VisitReportUpdateDoc - struct for updating a VR
 type VisitReportUpdateDoc struct {
-	Id          string     `json:"id" binding:"required" validate:"uuid"`
-	Subject     string     `json:"subject" binding:"required" validate:"max=255"`
+	Id          string     `json:"id" validate:"required,uuid"`
+	Subject     string     `json:"subject" validate:"required,max=255"`
 	Description string     `json:"description" validate:"max=500"`
 	Result      string     `json:"result" validate:"max=500"`
-	VisitDate   string     `json:"visitDate" binding:"required"`
-	Contact     ContactDoc `json:"contact"  binding:"required"`
+	VisitDate   string     `json:"visitDate" validate:"required"`
+	Contact     ContactDoc `json:"contact"  validate:"required"`
 }
 
 // VisitReportListDoc - struct for list operation
@@ -234,8 +245,38 @@ func updateInBg(doc VisitReportModel, contact *ContactDoc, wg *sync.WaitGroup) {
 	fmt.Printf("Request Units: %f\n", res.RUs)
 }
 
+func wrapValidationErrors(errs validator.ValidationErrors) []validationError {
+	validationErrors := make([]validationError, 0, len(errs))
+	for _, validationErr := range errs {
+		validationErrors = append(validationErrors, validationError{
+			ActualTag: validationErr.ActualTag(),
+			Namespace: validationErr.Namespace(),
+			Kind:      validationErr.Kind().String(),
+			Type:      validationErr.Type().String(),
+			Value:     fmt.Sprintf("%v", validationErr.Value()),
+			Param:     validationErr.Param(),
+		})
+	}
+
+	return validationErrors
+}
+
 func main() {
-	r := gin.Default()
+	app := iris.New()
+	app.Use(recover.New())
+	app.Validator = validator.New()
+	app.Use(logger.New())
+	app.Use(iris.Compression)
+	app.AllowMethods(iris.MethodOptions)
+	crs := cors.New(cors.Options{
+		AllowedOrigins:   []string{"*"},
+		AllowedMethods:   []string{"GET", "DELETE", "PUT", "POST", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type", "Content-Length", "Accept-Encoding", "X-CSRF-Token", "Authorization", "accept", "origin", "Cache-Control", "X-Requested-With"},
+		AllowCredentials: true,
+		ExposedHeaders:   []string{"Content-Length", "Location"},
+		MaxAge:           600,
+	})
+	app.Use(crs)
 	if os.Getenv("VR_ENV") != "production" {
 		err := godotenv.Load()
 		if err != nil {
@@ -267,38 +308,48 @@ func main() {
 
 	setupSubscription()
 
-	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{"GET", "DELETE", "PUT", "POST", "OPTIONS"},
-		AllowHeaders:     []string{"Content-Type", "Content-Length", "Accept-Encoding", "X-CSRF-Token", "Authorization", "accept", "origin", "Cache-Control", "X-Requested-With"},
-		ExposeHeaders:    []string{"Content-Length", "Location"},
-		AllowCredentials: true,
-		AllowOriginFunc: func(origin string) bool {
-			return true
-		},
-		MaxAge: 10 * time.Minute,
-	}))
-
-	r.GET("/", func(c *gin.Context) {
+	// Health check
+	app.Get("/", func(ctx iris.Context) {
 		if currentClient != nil {
-			c.Status(200)
+			ctx.StatusCode(200)
 		} else {
-			c.Status(500)
+			ctx.StatusCode(500)
 		}
 	})
-	r.GET("/reports", list)
-	r.GET("/reports/:reportid", read)
-	r.PUT("/reports/:reportid", update)
-	r.DELETE("/reports/:reportid", delete)
-	r.POST("/reports", create)
-	r.GET("/stats", readStatsOverall)
-	r.GET("/stats/:contactid", readStatsByContactID)
-	r.GET("/timeline", readStatsTimeline)
-	endless.ListenAndServe(":3000", r)
+	reportsAPI := app.Party("/reports")
+	{
+		reportsAPI.Get("/", list)
+		reportsAPI.Get("/{reportid}", read)
+		reportsAPI.Delete("/{reportid}", delete)
+		reportsAPI.Post("/", create)
+		reportsAPI.Put("/{reportid}", update)
+	}
+
+	statsAPI := app.Party("/stats")
+	{
+		statsAPI.Get("/", readStatsOverall)
+		statsAPI.Get("/{contactid}", readStatsByContactID)
+		statsAPI.Get("/timeline", readStatsTimeline)
+	}
+
+	idleConnsClosed := make(chan struct{})
+	iris.RegisterOnInterrupt(func() {
+		timeout := 10 * time.Second
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		// close all hosts.
+		app.Shutdown(ctx)
+		close(idleConnsClosed)
+	})
+
+	// [...]
+	app.Listen(":3000", iris.WithoutInterruptHandler, iris.WithoutServerError(iris.ErrServerClosed))
+	<-idleConnsClosed
+
 }
 
-func list(c *gin.Context) {
-	contactid := c.DefaultQuery("contactid", "")
+func list(ctx iris.Context) {
+	contactid := ctx.URLParamDefault("contactid", "")
 	qops := cosmosapi.DefaultQueryDocumentOptions()
 	qops.PartitionKeyValue = "visitreport"
 	var qry cosmosapi.Query
@@ -326,11 +377,12 @@ func list(c *gin.Context) {
 	}
 	out := []VisitReportListDoc{}
 	copier.Copy(&out, &docs)
-	c.JSON(http.StatusOK, out)
+	ctx.StatusCode(200)
+	ctx.JSON(out)
 }
 
-func read(c *gin.Context) {
-	reportid := c.Param("reportid")
+func read(ctx iris.Context) {
+	reportid := ctx.Params().GetString("reportid")
 	ro := cosmosapi.GetDocumentOptions{
 		PartitionKeyValue: "visitreport",
 	}
@@ -343,11 +395,12 @@ func read(c *gin.Context) {
 	}
 	out := VisitReportReadDoc{}
 	copier.Copy(&out, &doc)
-	c.JSON(http.StatusOK, out)
+	ctx.StatusCode(200)
+	ctx.JSON(out)
 }
 
-func delete(c *gin.Context) {
-	reportid := c.Param("reportid")
+func delete(ctx iris.Context) {
+	reportid := ctx.Params().GetString("reportid")
 	ro := cosmosapi.DeleteDocumentOptions{
 		PartitionKeyValue: "visitreport",
 	}
@@ -357,48 +410,55 @@ func delete(c *gin.Context) {
 		err = errors.WithStack(err)
 		fmt.Println(err)
 	}
-	c.Status(http.StatusOK)
+	ctx.StatusCode(http.StatusOK)
 }
 
-func create(c *gin.Context) {
-	vr := VisitReportModel{}
+func create(ctx iris.Context) {
+	vr := VisitReportCreateDoc{}
 
-	if err := c.ShouldBindJSON(&vr); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	err := ctx.ReadJSON(&vr)
+	if err != nil {
+		// Handle the error, below you will find the right way to do that...
+
+		if errs, ok := err.(validator.ValidationErrors); ok {
+			// Wrap the errors with JSON format, the underline library returns the errors as interface.
+			validationErrors := wrapValidationErrors(errs)
+
+			// Fire an application/json+problem response and stop the handlers chain.
+			ctx.StopWithProblem(iris.StatusBadRequest, iris.NewProblem().
+				Title("Validation error").
+				Detail("One or more fields failed to be validated").
+				Key("errors", validationErrors))
+
+			return
+		}
+
+		// It's probably an internal JSON error, let's dont give more info here.
+		ctx.StopWithStatus(iris.StatusInternalServerError)
 		return
 	}
 
-	vr.Type = "visitreport"
-	vr.Id = uuid.New().String()
+	model := VisitReportModel{}
+	model.Type = "visitreport"
+	model.Id = uuid.New().String()
+	copier.Copy(&model, &vr)
 	ops := cosmosapi.CreateDocumentOptions{}
 	ops = cosmosapi.CreateDocumentOptions{
 		PartitionKeyValue: "visitreport",
 	}
-	resource, _, err := currentClient.CreateDocument(context.Background(), currentCfg.DbName, "visitreports", vr, ops)
+	_, _, err = currentClient.CreateDocument(context.Background(), currentCfg.DbName, "visitreports", model, ops)
 	if err != nil {
 		err = errors.WithStack(err)
 		fmt.Println(err)
-		c.AbortWithError(http.StatusInternalServerError, err)
+		ctx.StopWithStatus(iris.StatusInternalServerError)
 		return
 	}
 
-	reportid := resource.Id
-	ro := cosmosapi.GetDocumentOptions{
-		PartitionKeyValue: "visitreport",
-	}
-
-	var doc VisitReportModel
-	_, errRead := currentClient.GetDocument(context.Background(), currentCfg.DbName, "visitreports", reportid, ro, &doc)
-	if errRead != nil {
-		errRead = errors.WithStack(errRead)
-		fmt.Println(errRead)
-	}
-
 	// send event
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	inctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	eventDoc := VisitReportEventDoc{}
-	copier.Copy(&eventDoc, &doc)
+	copier.Copy(&eventDoc, &model)
 	eventDoc.EventType = "VisitReportCreatedEvent"
 	eventDoc.Version = "1"
 	m, err := json.Marshal(eventDoc)
@@ -411,22 +471,40 @@ func create(c *gin.Context) {
 		ContentType: "application/json",
 		Data:        m,
 	}
-	err = currentTopic.Send(ctx, &sbMessage)
+	err = currentTopic.Send(inctx, &sbMessage)
 	if err != nil {
 		fmt.Printf("Error: %s", err)
 		return
 	}
 	out := VisitReportReadDoc{}
-	copier.Copy(&out, &doc)
-	c.JSON(http.StatusCreated, out)
+	copier.Copy(&out, &model)
+	ctx.StatusCode(http.StatusCreated)
+	ctx.JSON(out)
 }
 
-func update(c *gin.Context) {
-	reportid := c.Param("reportid")
+func update(ctx iris.Context) {
+	reportid := ctx.Params().GetString("reportid")
 	// Create visit report
 	var vr VisitReportUpdateDoc
-	if bindError := c.ShouldBindJSON(&vr); bindError != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": bindError.Error()})
+	err := ctx.ReadJSON(&vr)
+	if err != nil {
+		// Handle the error, below you will find the right way to do that...
+
+		if errs, ok := err.(validator.ValidationErrors); ok {
+			// Wrap the errors with JSON format, the underline library returns the errors as interface.
+			validationErrors := wrapValidationErrors(errs)
+
+			// Fire an application/json+problem response and stop the handlers chain.
+			ctx.StopWithProblem(iris.StatusBadRequest, iris.NewProblem().
+				Title("Validation error").
+				Detail("One or more fields failed to be validated").
+				Key("errors", validationErrors))
+
+			return
+		}
+
+		// It's probably an internal JSON error, let's dont give more info here.
+		ctx.StopWithStatus(iris.StatusInternalServerError)
 		return
 	}
 	ro := cosmosapi.GetDocumentOptions{
@@ -434,7 +512,7 @@ func update(c *gin.Context) {
 	}
 	model := VisitReportModel{}
 
-	_, err := currentClient.GetDocument(context.Background(), currentCfg.DbName, "visitreports", reportid, ro, &model)
+	_, err = currentClient.GetDocument(context.Background(), currentCfg.DbName, "visitreports", reportid, ro, &model)
 	if err != nil {
 		err = errors.WithStack(err)
 		fmt.Println(err)
@@ -449,12 +527,12 @@ func update(c *gin.Context) {
 	if err != nil {
 		err = errors.WithStack(err)
 		fmt.Println(err)
-		c.AbortWithError(http.StatusInternalServerError, err)
+		ctx.StopWithStatus(iris.StatusInternalServerError)
 		return
 	}
 
 	// send event
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	evctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	eventDoc := VisitReportEventDoc{}
 	copier.Copy(&eventDoc, &model)
@@ -470,18 +548,19 @@ func update(c *gin.Context) {
 		ContentType: "application/json",
 		Data:        m,
 	}
-	err = currentTopic.Send(ctx, &sbMessage)
+	err = currentTopic.Send(evctx, &sbMessage)
 	if err != nil {
 		fmt.Printf("Error: %s", err)
 		return
 	}
 	doc := VisitReportReadDoc{}
 	copier.Copy(&model, &doc)
-	c.JSON(http.StatusOK, doc)
+	ctx.StatusCode(http.StatusOK)
+	ctx.JSON(doc)
 }
 
-func readStatsByContactID(c *gin.Context) {
-	contactid := c.Param("contactid")
+func readStatsByContactID(ctx iris.Context) {
+	contactid := ctx.Params().GetString("contactid")
 	qops := cosmosapi.DefaultQueryDocumentOptions()
 	qops.PartitionKeyValue = "visitreport"
 	qry := cosmosapi.Query{
@@ -499,10 +578,11 @@ func readStatsByContactID(c *gin.Context) {
 		err = errors.WithStack(err)
 		fmt.Println(err)
 	}
-	c.JSON(http.StatusOK, docs)
+	ctx.StatusCode(http.StatusOK)
+	ctx.JSON(docs)
 }
 
-func readStatsOverall(c *gin.Context) {
+func readStatsOverall(ctx iris.Context) {
 	qops := cosmosapi.DefaultQueryDocumentOptions()
 	qops.PartitionKeyValue = "visitreport"
 	qry := cosmosapi.Query{
@@ -510,7 +590,7 @@ func readStatsOverall(c *gin.Context) {
 					COUNT(1) as countScore,
 					AVG(c.visitResultSentimentScore) as avgScore,
 					MAX(c.visitResultSentimentScore) as maxScore,
-					MIN(c.visitResultSentimentScore) as minScore 
+					MIN(c.visitResultSentimentScore) as minScore
 				FROM c
 				WHERE c.type = 'visitreport' and c.result != ''
 				GROUP BY c.type`,
@@ -521,10 +601,11 @@ func readStatsOverall(c *gin.Context) {
 		err = errors.WithStack(err)
 		fmt.Println(err)
 	}
-	c.JSON(http.StatusOK, docs)
+	ctx.StatusCode(http.StatusOK)
+	ctx.JSON(docs)
 }
 
-func readStatsTimeline(c *gin.Context) {
+func readStatsTimeline(ctx iris.Context) {
 	qops := cosmosapi.DefaultQueryDocumentOptions()
 	qops.PartitionKeyValue = "visitreport"
 	qry := cosmosapi.Query{
@@ -541,5 +622,6 @@ func readStatsTimeline(c *gin.Context) {
 		err = errors.WithStack(err)
 		fmt.Println(err)
 	}
-	c.JSON(http.StatusOK, docs)
+	ctx.StatusCode(http.StatusOK)
+	ctx.JSON(docs)
 }
